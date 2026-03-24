@@ -800,22 +800,101 @@ export const useVaultContract = () => {
     };
 
     const getProposalSignatures = useCallback(async (proposalId: number) => {
-        console.log('Getting signatures for proposal:', proposalId);
-        return Promise.resolve([
-            { address: 'GABC...XYZ', name: 'Signer 1', signed: true, timestamp: new Date().toISOString() },
-            { address: 'GDEF...UVW', name: 'Signer 2', signed: false, timestamp: undefined },
-        ]);
-    }, []);
+        try {
+            // Get the full signer list from vault config
+            const [configPrimary, configLegacy] = await Promise.all([
+                readContractValue('get_config').catch(() => null),
+                readContractValue('get_vault_config').catch(() => null),
+            ]);
+            const configRaw = configPrimary ?? configLegacy;
+            const configObject = (configRaw && typeof configRaw === 'object') ? configRaw as Record<string, unknown> : {};
+            const allSigners = parseSignerAddresses(configObject.signers);
 
-    const remindSigner = useCallback(async (proposalId: number, signerAddress: string) => {
-        console.log('Reminding signer:', signerAddress, 'for proposal:', proposalId);
-        return Promise.resolve();
+            // Fetch events to find approvals for this specific proposal
+            const latestRes = await fetch(env.sorobanRpcUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getLatestLedger' }),
+            });
+            const latestData = await latestRes.json() as { result?: { sequence?: number } };
+            const latestLedger = latestData?.result?.sequence ?? 0;
+            const startLedger = Math.max(1, latestLedger - 50000);
+
+            const evRes = await fetch(env.sorobanRpcUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0', id: 2, method: 'getEvents',
+                    params: {
+                        startLedger: String(startLedger),
+                        filters: [{ type: 'contract', contractIds: [env.contractId] }],
+                        pagination: { limit: 200 },
+                    },
+                }),
+            });
+            const evData = await evRes.json() as { result?: { events?: RawEvent[] } };
+            const events: RawEvent[] = evData.result?.events ?? [];
+
+            // Collect approvals for this proposal id
+            const approvalMap = new Map<string, string>(); // address -> timestamp
+            const proposalIdStr = String(proposalId);
+            for (const ev of events) {
+                const topic0 = ev.topic?.[0];
+                if (!topic0) continue;
+                const evType = getEventTypeFromTopic(topic0);
+                if (evType !== 'proposal_approved') continue;
+                const evId = String(ev.id.split('-')[0] ?? ev.id);
+                if (evId !== proposalIdStr) continue;
+                const valueXdr = ev.value?.xdr;
+                if (!valueXdr) continue;
+                const { actor } = parseEventValue(valueXdr, evType);
+                if (actor) approvalMap.set(actor, ev.ledgerClosedAt ?? new Date().toISOString());
+            }
+
+            // Build signer list: known signers first, then any approvers not in config
+            const signerSet = new Set(allSigners);
+            for (const addr of approvalMap.keys()) {
+                if (!signerSet.has(addr)) allSigners.push(addr);
+            }
+
+            return allSigners.map(addr => ({
+                address: addr,
+                signed: approvalMap.has(addr),
+                timestamp: approvalMap.get(addr),
+            }));
+        } catch (e) {
+            console.error('getProposalSignatures failed:', e);
+            return [];
+        }
+    }, [readContractValue]);
+
+    const remindSigner = useCallback(async (_proposalId: number, signerAddress: string) => {
+        // Copy a deep-link to clipboard so the user can share it with the signer
+        const url = `${window.location.origin}/dashboard/proposals?signer=${encodeURIComponent(signerAddress)}`;
+        try {
+            await navigator.clipboard.writeText(url);
+        } catch {
+            // fallback: no-op if clipboard unavailable
+        }
     }, []);
 
     const exportSignatures = useCallback(async (proposalId: number) => {
-        console.log('Exporting signatures for proposal:', proposalId);
-        return Promise.resolve();
-    }, []);
+        try {
+            const sigs = await getProposalSignatures(proposalId);
+            const blob = new Blob(
+                [JSON.stringify({ proposalId, exportedAt: new Date().toISOString(), signatures: sigs }, null, 2)],
+                { type: 'application/json' }
+            );
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `proposal-${proposalId}-signatures.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            console.error('exportSignatures failed:', e);
+        }
+    }, [getProposalSignatures]);
 
     const getProposalComments = useCallback(async (proposalId: string): Promise<Comment[]> => {
         return proposalComments[proposalId] ?? [];
